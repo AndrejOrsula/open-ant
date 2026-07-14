@@ -203,9 +203,15 @@ class MPO:
         self.dual_beta1_pow = torch.ones((), dtype=torch.float32, device=self.device)
         self.dual_beta2_pow = torch.ones((), dtype=torch.float32, device=self.device)
 
-        # Scalar Lagrange multipliers for M-step KL constraints.
-        self.alpha_mu = 1e-3 #if 0.0 first policy imporvement steps are unconstrained
-        self.alpha_sigma = 1e-3
+        # Lagrange multipliers for M-step KL constraints.
+        self.log_alpha_mu = torch.tensor(math.log(1e-3), dtype=torch.float32, device=self.device)
+        self.alpha_mu = float(self.log_alpha_mu.exp())
+        self.log_alpha_sigma = torch.tensor(math.log(1e-3), dtype=torch.float32, device=self.device)
+        self.alpha_sigma = float(self.log_alpha_sigma.exp())
+        self.alpha_dual_state = {
+            k: [torch.zeros((), dtype=torch.float32, device=self.device)]
+            for k in ("mu", "sigma")
+        }
 
         self.obs_dim = int(np.array(self.envs.single_observation_space.shape).prod())
         self.act_dim = int(np.prod(self.envs.single_action_space.shape))
@@ -532,10 +538,26 @@ class MPO:
         # Dual-ascent update once per _learn() call, not per inner gradient step.
         # With mstep_iteration_num=5 and utd_ratio=3, updating inside the loop
         # applies 15 alpha updates per env step, causing KL constraint oscillation.
-        self.alpha_mu += self.args.alpha_mean_scale * (kl_mu_val - self.args.kl_mean_constraint)
-        self.alpha_mu = float(np.clip(self.alpha_mu, 0.0, self.args.alpha_mean_max))
-        self.alpha_sigma += self.args.alpha_var_scale * (kl_sigma_val - self.args.kl_var_constraint)
-        self.alpha_sigma = float(np.clip(self.alpha_sigma, 0.0, self.args.alpha_var_max))
+        def _optimize_alpha_dual(log_alpha, u, kl, epsilon, lr):
+            """Adamax(beta1=0)"""
+            grad = log_alpha.exp() * (epsilon - kl)
+            u = torch.maximum(0.999 * u, grad.abs())
+            log_alpha = (log_alpha - lr * grad / (u + 1e-8)).clamp(-8.0, 8.0)
+            return log_alpha, u
+
+        for key, log_alpha_attr, kl_val, eps in (
+            ("mu", "log_alpha_mu", kl_mu_val, self.args.kl_mean_constraint),
+            ("sigma", "log_alpha_sigma", kl_sigma_val, self.args.kl_var_constraint),
+        ):
+            (u,) = self.alpha_dual_state[key]
+            log_alpha, u = _optimize_alpha_dual(
+                getattr(self, log_alpha_attr), u, kl_val, eps, self.args.alpha_dual_lr,
+            )
+            setattr(self, log_alpha_attr, log_alpha)
+            self.alpha_dual_state[key] = [u]
+
+        self.alpha_mu = float(self.log_alpha_mu.exp())
+        self.alpha_sigma = float(self.log_alpha_sigma.exp())
 
         return loss_p_val, kl_mu_val, kl_sigma_val
 
@@ -630,8 +652,12 @@ class MPO:
             "dual_v": self.dual_v.item(),
             "dual_beta1_pow": self.dual_beta1_pow.item(),
             "dual_beta2_pow": self.dual_beta2_pow.item(),
+            "log_alpha_mu": self.log_alpha_mu.item(),
             "alpha_mu": self.alpha_mu,
+            "log_alpha_sigma": self.log_alpha_sigma.item(),
             "alpha_sigma": self.alpha_sigma,
+            "alpha_dual_state": {k: [t.item() for t in v]
+                                 for k, v in self.alpha_dual_state.items()},
             "global_step": global_step,
         }
         torch.save(checkpoint, os.path.join(self.weights_folder, f"checkpoint_{global_step}.pth"))
@@ -659,8 +685,13 @@ class MPO:
             self.dual_v.fill_(checkpoint["dual_v"])
             self.dual_beta1_pow.fill_(checkpoint["dual_beta1_pow"])
             self.dual_beta2_pow.fill_(checkpoint["dual_beta2_pow"])
-        self.alpha_mu = float(checkpoint.get("alpha_mu", 0.0))
-        self.alpha_sigma = float(checkpoint.get("alpha_sigma", 0.0))
+        for name, log_attr in (("alpha_mu", "log_alpha_mu"), ("alpha_sigma", "log_alpha_sigma")):
+            getattr(self, log_attr).fill_(float(checkpoint[f"log_{name}"]))
+        for k, vals in checkpoint["alpha_dual_state"].items():
+            for tensor, value in zip(self.alpha_dual_state[k], vals):
+                tensor.fill_(value)
+        self.alpha_mu = float(self.log_alpha_mu.exp())
+        self.alpha_sigma = float(self.log_alpha_sigma.exp())
         self.global_step = checkpoint.get("global_step", 0)
         print(f"[√] Loaded checkpoint from {weights_path}, global_step={self.global_step}")
 
@@ -756,10 +787,10 @@ def parse_args():
                         help="epsilon_mu for M-step mean KL")
     parser.add_argument("--kl_var_constraint", type=float, default=1e-4,
                         help="epsilon_sigma for M-step covariance KL")
-    parser.add_argument("--alpha_mean_scale", type=float, default=1.0)
-    parser.add_argument("--alpha_var_scale", type=float, default=20.0)
-    parser.add_argument("--alpha_mean_max", type=float, default=0.1)
-    parser.add_argument("--alpha_var_max", type=float, default=10.0)
+    parser.add_argument("--alpha_dual_lr", type=float, default=1e-2,
+                        help="Adamax lr for the log-space M-step KL multipliers. This is exactly "
+                             "the per-update step in log-space, so do not set it much below 1e-2: "
+                             "alpha must travel ~12 nats (1e-3 -> ~100) inside a run.")
     parser.add_argument("--sample_action_num", type=int, default=64,
                         help="actions sampled per state in E-step")
     parser.add_argument("--mstep_iteration_num", type=int, default=5,
